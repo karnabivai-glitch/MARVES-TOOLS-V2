@@ -2069,6 +2069,43 @@ function idbAddMovement(entry){
     tx.oncomplete = ()=>{ idbEnqueueSync("movementlog", "put", entry.id, entry).then(resolve); };
   });
 }
+// Versi bulk untuk import massal (ribuan baris): tulis ke IndexedDB per potongan kecil
+// (supaya UI tidak macet), tapi HANYA SATU antrean sinkron untuk seluruh data —
+// bukan satu per baris. Ini yang membuat import Excel besar tidak lagi lambat.
+function idbAddScanBulk(list){
+  return new Promise((resolve, reject)=>{
+    if(!list || !list.length) return resolve();
+    const CHUNK = 2000;
+    let i = 0;
+    function nextChunk(){
+      const slice = list.slice(i, i + CHUNK);
+      if(!slice.length){ idbEnqueueSync("scanlog", "put", list.map(x=>x.id), list).then(resolve); return; }
+      const tx = idb.transaction("scanlog", "readwrite");
+      const store = tx.objectStore("scanlog");
+      slice.forEach(item => store.put(item));
+      tx.oncomplete = ()=>{ i += CHUNK; nextChunk(); };
+      tx.onerror = ()=>reject(tx.error);
+    }
+    nextChunk();
+  });
+}
+function idbAddMovementBulk(list){
+  return new Promise((resolve, reject)=>{
+    if(!list || !list.length) return resolve();
+    const CHUNK = 2000;
+    let i = 0;
+    function nextChunk(){
+      const slice = list.slice(i, i + CHUNK);
+      if(!slice.length){ idbEnqueueSync("movementlog", "put", list.map(x=>x.id), list).then(resolve); return; }
+      const tx = idb.transaction("movementlog", "readwrite");
+      const store = tx.objectStore("movementlog");
+      slice.forEach(item => store.put(item));
+      tx.oncomplete = ()=>{ i += CHUNK; nextChunk(); };
+      tx.onerror = ()=>reject(tx.error);
+    }
+    nextChunk();
+  });
+}
 function idbGetAllMovements(){
   return new Promise((resolve)=>{
     const tx = idb.transaction("movementlog", "readonly");
@@ -5369,23 +5406,30 @@ document.getElementById("btnClearAllScan").onclick = async ()=>{
 document.getElementById("fileUploadScan").addEventListener("change", async (e) => {
   const file = e.target.files[0];
   if(!file) return;
-  toast("Memproses file ke lokal...", "warning");
+  toast("Memproses file...", "warning");
   const reader = new FileReader();
   reader.onload = async (evt) => {
     try {
       const wb = XLSX.read(evt.target.result, { type: "array" });
       const ws = wb.Sheets[wb.SheetNames[0]];
       const rows = XLSX.utils.sheet_to_json(ws, { defval: "" });
-      let successCount = 0;
       const uploadedBins = new Set();
-      
+
+      // Ambil Master SEKALI ke Map di memori, bukan idbGetMaster() per baris —
+      // untuk 30-40 ribuan baris ini yang paling menghemat waktu (ribuan transaksi
+      // IndexedDB berulang jadi cukup satu pembacaan).
+      const masterMap = new Map((await idbGetAllMaster()).map(p => [p.sku, p]));
+
+      const scanEntries = [];
+      const moveEntries = [];
+
       for(let r of rows) {
         if(!r) continue;
         const keys = Object.keys(r);
         const skuKey = keys.find(k=>k.trim().toLowerCase() === "sku" || k.trim().toLowerCase().includes("sku"));
         const binKey = keys.find(k=>k.trim().toLowerCase().includes("bin"));
         const waktuKey = keys.find(k=>k.trim().toLowerCase() === "waktu scan" || k.trim().toLowerCase() === "waktu masuk" || k.trim().toLowerCase().includes("waktu") || k.trim().toLowerCase().includes("time") || k.trim().toLowerCase().includes("tanggal"));
-        
+
         const skuVal = skuKey ? String(r[skuKey]).trim() : null;
         if(!skuVal) continue;
         // Kolom UID (hasil export Data Induk): "-" / kosong berarti unit tanpa UID
@@ -5394,30 +5438,32 @@ document.getElementById("fileUploadScan").addEventListener("change", async (e) =
         if (uidVal === "-" || uidVal === "N/A") uidVal = "";
         const binVal = binKey ? String(r[binKey]).trim().toUpperCase() : "-";
         if (binVal && binVal !== "-") uploadedBins.add(binVal);
-        
+
         let finalTs = new Date().toISOString();
         if(waktuKey && r[waktuKey]) {
             let parsedDate = parseIdDate(r[waktuKey]);
             if (parsedDate) finalTs = parsedDate;
         }
 
-        let product = await idbGetMaster(skuVal);
-        const entry = {
-          id: generateID(),
-          sku: skuVal,
-          uid: uidVal || null,
+        const product = masterMap.get(skuVal);
+        const id = generateID();
+        scanEntries.push({
+          id, sku: skuVal, uid: uidVal || null,
           nama: product ? product.nama : "Tidak Dikenali",
-          found: !!product,
-          bin: binVal,
-          ts: finalTs, 
-          type: "IN",
-          sessionActive: false 
-        };
-        await idbAddScan(entry);
-        await recordMovement(entry.id, "INBOUND", skuVal, product ? product.nama : "-", binVal, "Batch Upload Excel");
-        successCount++;
+          found: !!product, bin: binVal, ts: finalTs,
+          type: "IN", sessionActive: false
+        });
+        moveEntries.push({
+          id: generateMoveID(), ref_id: id, type: "INBOUND",
+          sku: skuVal, nama: product ? product.nama : "-", bin: binVal,
+          remark: "Batch Upload Excel", docNo: "", ts: finalTs
+        });
       }
-      
+
+      await idbAddScanBulk(scanEntries);
+      await idbAddMovementBulk(moveEntries);
+      const successCount = scanEntries.length;
+
       // Daftarkan otomatis setiap Bin baru dari file upload ke Master Bin (Pencarian Riwayat),
       // supaya Bin tersebut tetap tampil (qty otomatis 0 & berwarna merah) walau stoknya nanti habis.
       if (uploadedBins.size > 0) {
@@ -5427,11 +5473,12 @@ document.getElementById("fileUploadScan").addEventListener("change", async (e) =
           });
           if (binsChanged) saveMasterBins();
       }
-      
+
       document.getElementById("fileUploadScan").value = "";
-      allScanRenderLimit = 200; 
+      allScanRenderLimit = 200;
       await loadAllScan();
-      toast(`✓ Berhasil import ${successCount} data ke lokal`, "good");
+      toast(`✓ ${successCount} data tersimpan ke Lokal, sedang disinkron ke Cloud...`, "good");
+      flushSyncQueue();
     } catch (err) {
       console.error(err);
       toast("Gagal memproses file upload", "bad");
