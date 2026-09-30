@@ -1506,29 +1506,79 @@ function saveCloudCfg(url, token){
   localStorage.setItem("gas_token", CLOUD_CFG.token);
 }
 
-async function cloudApi(action, payload, signal){
-  if(!CLOUD_CFG.url){ const e = new Error("URL Google Apps Script belum diatur. Klik ⚙️ di pojok kanan atas."); e.code = "NO_CFG"; throw e; }
+// Timeout per jenis permintaan. Tanpa timeout, satu request Apps Script yang "menggantung"
+// membuat syncBusy macet selamanya sehingga antrean tidak pernah terkirim lagi.
+const CLOUD_TIMEOUT_MS = { ping: 20000, pull: 30000, pullAll: 30000, batch: 90000 };
+const CLOUD_RETRYABLE_CODES = { NETWORK: 1, BAD_RESPONSE: 1, TIMEOUT: 1 };
+const CLOUD_RETRYABLE_MSG = /lock|busy|sibuk|too many|terlalu banyak|rate|quota|unavailable/i;
+function sleep_(ms){ return new Promise(r => setTimeout(r, ms)); }
+
+async function cloudApiOnce_(action, payload, extSignal){
   const body = Object.assign({ action, token: CLOUD_CFG.token }, payload || {});
-  let res;
+  const ctrl = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => { timedOut = true; ctrl.abort(); }, CLOUD_TIMEOUT_MS[action] || 30000);
+  const onExtAbort = () => ctrl.abort();
+  if(extSignal){ if(extSignal.aborted) ctrl.abort(); else extSignal.addEventListener("abort", onExtAbort); }
+  const mkTimeout = () => { const e = new Error("Server Google Apps Script terlalu lama merespons (timeout)."); e.code = "TIMEOUT"; return e; };
   try{
-    res = await fetch(CLOUD_CFG.url, {
-      method: "POST",
-      headers: { "Content-Type": "text/plain;charset=utf-8" }, // hindari CORS preflight ke Apps Script
-      body: JSON.stringify(body),
-      signal
-    });
-  }catch(networkErr){
-    if(networkErr && networkErr.name === "AbortError") throw networkErr; // dibatalkan pengguna, teruskan apa adanya
-    const e = new Error("Tidak bisa menghubungi server Google Apps Script (offline / jaringan bermasalah).");
-    e.code = "NETWORK"; throw e;
+    let res;
+    try{
+      res = await fetch(CLOUD_CFG.url, {
+        method: "POST",
+        headers: { "Content-Type": "text/plain;charset=utf-8" }, // hindari CORS preflight ke Apps Script
+        body: JSON.stringify(body),
+        signal: ctrl.signal
+      });
+    }catch(networkErr){
+      if(timedOut) throw mkTimeout();
+      if(networkErr && networkErr.name === "AbortError") throw networkErr; // dibatalkan pengguna
+      // Catatan: saat Apps Script kelebihan beban / kena kuota, Google membalas halaman error tanpa
+      // header CORS, dan browser melaporkannya sebagai "Failed to fetch" (mirip offline).
+      const e = new Error("Tidak bisa menghubungi server Google Apps Script (" +
+        (navigator.onLine === false ? "perangkat offline" : "server sibuk/menolak koneksi") + ").");
+      e.code = "NETWORK"; throw e;
+    }
+    let txt;
+    try{ txt = await res.text(); }
+    catch(readErr){
+      if(timedOut) throw mkTimeout();
+      if(readErr && readErr.name === "AbortError") throw readErr;
+      const e = new Error("Respon dari server Apps Script terputus."); e.code = "NETWORK"; throw e;
+    }
+    let data;
+    try{ data = JSON.parse(txt); }
+    catch(parseErr){
+      const snippet = String(txt || "").replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim().slice(0, 90);
+      const e = new Error("Respon server Apps Script tidak valid (HTTP " + res.status + ")" + (snippet ? ": " + snippet : "") + " — cek URL / deployment.");
+      e.code = "BAD_RESPONSE"; throw e;
+    }
+    if(!data.ok){ const e = new Error(data.error || "Gagal memproses permintaan."); e.code = data.code || "ERR"; throw e; }
+    return data;
+  } finally {
+    clearTimeout(timer);
+    if(extSignal) extSignal.removeEventListener("abort", onExtAbort);
   }
-  let data;
-  try{ data = await res.json(); }catch(parseErr){
-    const e = new Error("Respon server Apps Script tidak valid (cek URL / deployment).");
-    e.code = "BAD_RESPONSE"; throw e;
+}
+
+// Semua operasi ke server bersifat idempoten (put/del/clear berdasarkan key, pull berdasarkan
+// cursor), jadi aman diulang otomatis bila gagal sementara (jaringan, server sibuk, timeout).
+async function cloudApi(action, payload, signal, opts){
+  if(!CLOUD_CFG.url){ const e = new Error("URL Google Apps Script belum diatur. Klik ⚙️ di pojok kanan atas."); e.code = "NO_CFG"; throw e; }
+  const maxTry = ((opts && opts.retries != null) ? opts.retries : 2) + 1;
+  let lastErr;
+  for(let i = 0; i < maxTry; i++){
+    try{
+      return await cloudApiOnce_(action, payload, signal);
+    }catch(err){
+      lastErr = err;
+      if(err && err.name === "AbortError") throw err;
+      const retryable = CLOUD_RETRYABLE_CODES[err.code] || (err.code === "ERR" && CLOUD_RETRYABLE_MSG.test(err.message || ""));
+      if(!retryable || i === maxTry - 1) throw err;
+      await sleep_(700 * Math.pow(3, i) + Math.random() * 300);
+    }
   }
-  if(!data.ok){ const e = new Error(data.error || "Gagal memproses permintaan."); e.code = data.code || "ERR"; throw e; }
-  return data;
+  throw lastErr;
 }
 
 let idb;
@@ -1572,12 +1622,12 @@ function idbEnqueueSync(table, op, keyOrKeys, dataOrRows){
   });
 }
 // Begitu ada perubahan (scan, transfer bin, dll), kirim ke Cloud SEGERA — tidak menunggu
-// timer periodik 20 detik. Di-debounce sebentar (900ms) supaya beberapa scan beruntun tidak
+// timer periodik 20 detik. Di-debounce sebentar (400ms) supaya beberapa scan beruntun tidak
 // memicu banyak request terpisah, cukup satu setelah "jeda" aktivitas.
 let flushDebounceTimer = null;
 function scheduleFlushSoon(){
   if(flushDebounceTimer) clearTimeout(flushDebounceTimer);
-  flushDebounceTimer = setTimeout(()=>{ flushDebounceTimer = null; flushSyncQueue(); }, 900);
+  flushDebounceTimer = setTimeout(()=>{ flushDebounceTimer = null; flushSyncQueue(); }, 400);
 }
 function idbGetSyncQueue(limit){
   return new Promise((resolve)=>{
@@ -1602,6 +1652,7 @@ function idbDeleteSyncQueueIds(qids){
     const store = tx.objectStore("syncqueue");
     qids.forEach(id => store.delete(id));
     tx.oncomplete = ()=>resolve();
+    tx.onerror = tx.onabort = ()=>resolve(); // jangan sampai promise menggantung selamanya
   });
 }
 // Buang SELURUH antrean sinkron yang belum terkirim (dipakai oleh tombol "Batalkan Sinkron").
@@ -1639,42 +1690,125 @@ function idbClearLocalOnly_(table){
 }
 
 let syncBusy = false;
+let syncBusySince = 0;
+let syncDirty = false;          // ada permintaan flush yang masuk saat flush lain masih berjalan
+let flushFailCount = 0;
+let flushRetryTimer = null;
 let currentSyncAbort = null;
-// Antrean digabung per 1000 item per permintaan HTTP (bukan 200): di backend, op 'put'/'del'
-// berurutan pada tabel yang sama sekarang digabung jadi satu operasi tulis, jadi mengirim
-// lebih banyak sekaligus = lebih sedikit bolak-balik jaringan tanpa membebani satu request.
-const SYNC_BATCH_SIZE = 1000;
+
+// Status sinkron untuk indikator di sidebar (sebelumnya kegagalan tarik data tidak terlihat sama sekali).
+const syncState = { pushErr: null, pullErr: null, lastPull: 0, lastPush: 0 };
+function fmtClock_(ms){
+  const d = new Date(ms);
+  const p = n => String(n).padStart(2, "0");
+  return p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+}
+function renderConn_(){
+  if(!CLOUD_CFG.url) return;
+  let ok = true, text, detail = "";
+  if(syncState.pushErr){
+    ok = false; text = syncState.pushErr.cancelled ? "Sinkron dibatalkan" : "Gagal kirim ke Cloud — mencoba lagi";
+    detail = syncState.pushErr.msg || "";
+  } else if(syncState.pullErr){
+    ok = false; text = "Gagal tarik data Cloud — mencoba lagi";
+    detail = syncState.pullErr.msg || "";
+  } else {
+    const last = Math.max(syncState.lastPull, syncState.lastPush);
+    text = last ? "Tersambung • sinkron " + fmtClock_(last) : "Tersambung ke Google Sheets";
+    detail = "Klik untuk sinkron sekarang";
+  }
+  setConn(ok, text);
+  const dot = document.getElementById("connDot"), txt = document.getElementById("connText");
+  if(dot) dot.title = detail; if(txt) txt.title = detail;
+}
+
+// Antrean dikirim per potongan kecil. Permintaan yang terlalu besar (mis. ribuan baris sekaligus)
+// lambat diproses Apps Script dan gampang timeout, lalu SELURUHNYA diulang dari nol.
+const SYNC_BATCH_SIZE = 400;          // maks entri antrean yang dibaca per putaran
+const SYNC_MAX_OPS_PER_REQ = 200;     // maks operasi per satu request HTTP
+const SYNC_MAX_ROWS_PER_REQ = 1500;   // maks baris/kunci per satu request HTTP
+function chunkArray_(arr, n){
+  const out = [];
+  for(let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n));
+  return out;
+}
+// Ubah entri antrean menjadi daftar request berurutan. qid sebuah entri baru dihapus dari antrean
+// setelah request yang memuat potongan TERAKHIR entri itu sukses (urutan put/del/clear tetap terjaga).
+function buildSyncRequests_(items){
+  const reqs = [];
+  let cur = { ops: [], qids: [], weight: 0 };
+  const flushCur = () => { if(cur.ops.length || cur.qids.length) reqs.push(cur); cur = { ops: [], qids: [], weight: 0 }; };
+  for(const it of items){
+    let units;
+    if(it.op === "clear"){
+      units = [{ op: "clear", table: it.table }];
+    } else if(it.op === "del"){
+      const keys = Array.isArray(it.key) ? it.key : [it.key];
+      units = chunkArray_(keys, SYNC_MAX_ROWS_PER_REQ).map(k => ({ op: "del", table: it.table, keys: k }));
+    } else {
+      const rows = Array.isArray(it.data) ? it.data : [it.data];
+      units = chunkArray_(rows, SYNC_MAX_ROWS_PER_REQ).map(r => ({ op: "put", table: it.table, rows: r }));
+    }
+    if(!units.length){ cur.qids.push(it.qid); continue; }
+    units.forEach((u, idx) => {
+      const w = u.rows ? u.rows.length : (u.keys ? u.keys.length : 1);
+      if(cur.ops.length && (cur.weight + w > SYNC_MAX_ROWS_PER_REQ || cur.ops.length >= SYNC_MAX_OPS_PER_REQ)) flushCur();
+      cur.ops.push(u); cur.weight += w;
+      if(idx === units.length - 1) cur.qids.push(it.qid);
+    });
+  }
+  flushCur();
+  return reqs;
+}
+
+function scheduleFlushRetry_(){
+  flushFailCount++;
+  const delay = Math.min(30000, 2000 * Math.pow(2, flushFailCount - 1)); // 2s, 4s, 8s ... maks 30s
+  if(flushRetryTimer) clearTimeout(flushRetryTimer);
+  flushRetryTimer = setTimeout(() => { flushRetryTimer = null; flushSyncQueue(); }, delay);
+}
+
 async function flushSyncQueue(){
-  if(syncBusy || !CLOUD_CFG.url) return;
-  syncBusy = true;
+  if(!CLOUD_CFG.url) return;
+  if(syncBusy){
+    if(Date.now() - syncBusySince < 180000){ syncDirty = true; return; }
+    syncBusy = false; // pengaman: flush sebelumnya macet > 3 menit, lepaskan kuncinya
+  }
+  syncBusy = true; syncBusySince = Date.now(); syncDirty = false;
+  if(flushRetryTimer){ clearTimeout(flushRetryTimer); flushRetryTimer = null; }
+  let failed = false;
   try{
+    // Baca ulang antrean sampai benar-benar kosong, supaya scan yang masuk SAAT flush berjalan
+    // ikut terkirim sekarang juga (bukan menunggu timer berikutnya).
     while(true){
       const items = await idbGetSyncQueue(SYNC_BATCH_SIZE);
       if(!items.length) break;
-      const ops = items.map(it => {
-        if(it.op === "clear") return { op: "clear", table: it.table };
-        if(it.op === "del") return { op: "del", table: it.table, keys: Array.isArray(it.key) ? it.key : [it.key] };
-        return { op: "put", table: it.table, rows: Array.isArray(it.data) ? it.data : [it.data] };
-      });
-      currentSyncAbort = new AbortController();
-      await cloudApi("batch", { ops }, currentSyncAbort.signal);
-      currentSyncAbort = null;
-      await idbDeleteSyncQueueIds(items.map(it => it.qid));
-      updateSyncBadge();
-      if(items.length < SYNC_BATCH_SIZE) break;
+      for(const rq of buildSyncRequests_(items)){
+        if(rq.ops.length){
+          currentSyncAbort = new AbortController();
+          await cloudApi("batch", { ops: rq.ops }, currentSyncAbort.signal);
+          currentSyncAbort = null;
+        }
+        await idbDeleteSyncQueueIds(rq.qids);
+        updateSyncBadge();
+      }
     }
-    setConn(true, "Tersambung ke Google Sheets");
+    syncState.pushErr = null; syncState.lastPush = Date.now(); flushFailCount = 0;
   }catch(err){
     currentSyncAbort = null;
+    failed = true;
     if(err && err.name === "AbortError"){
-      setConn(false, "Sinkron dibatalkan");
+      syncState.pushErr = { cancelled: true, msg: "Sinkron dibatalkan" };
     } else {
       console.error("Gagal sinkron ke cloud:", err);
-      setConn(false, err.code === "NO_CFG" ? "URL/Token Cloud belum diatur" : "Gagal sinkron — akan dicoba lagi");
+      syncState.pushErr = { msg: (err && err.message) || String(err), code: err && err.code };
+      if(!(err && err.code === "NO_CFG")) scheduleFlushRetry_();
     }
   }finally{
     syncBusy = false;
+    renderConn_();
     updateSyncBadge();
+    if(syncDirty && !failed) setTimeout(flushSyncQueue, 50);
   }
 }
 async function updateSyncBadge(){
@@ -1694,6 +1828,8 @@ async function updateSyncBadge(){
 // menyelesaikan apa yang sedang dikerjakannya. Tombol ini menghentikan PENGIRIMAN BERIKUTNYA.
 function cancelSync(){
   if(currentSyncAbort){ try{ currentSyncAbort.abort(); }catch(e){} }
+  if(flushRetryTimer){ clearTimeout(flushRetryTimer); flushRetryTimer = null; }
+  flushFailCount = 0; syncState.pushErr = null;
   return idbClearSyncQueueAll().then(()=>{
     updateSyncBadge();
     toast("Antrean sinkron lokal dibersihkan.", "warning");
@@ -1715,12 +1851,16 @@ function initSyncControls(){
 // bukan satu transaksi per baris — ini yang paling menentukan cepat/lambatnya data
 // muncul saat aplikasi dibuka pertama kali di perangkat/browser baru.
 function idbApplyPulledRows_(table, rows){
-  return new Promise((resolve)=>{
+  return new Promise((resolve, reject)=>{
     const tx = idb.transaction(table, "readwrite");
     const store = tx.objectStore(table);
-    rows.forEach(row => { if(row.d) store.delete(row.k); else store.put(row.v); });
+    rows.forEach(row => {
+      try{ if(row.d) store.delete(row.k); else store.put(row.v); }
+      catch(rowErr){ console.warn("Baris hasil tarik dilewati:", table, rowErr); } // satu baris rusak tidak boleh menghentikan semuanya
+    });
     tx.oncomplete = ()=>resolve();
-    tx.onerror = ()=>resolve(); // jangan sampai satu baris bermasalah menghentikan seluruh sinkron
+    // Kalau transaksi gagal, jangan diam-diam lanjut: cursor tidak boleh maju, supaya baris ini ditarik ulang.
+    tx.onerror = tx.onabort = ()=>reject(tx.error || new Error("Gagal menulis data hasil tarik ke database lokal"));
   });
 }
 async function pullFromCloud(table){
@@ -1748,38 +1888,85 @@ async function pullFromCloud(table){
   }
   return total;
 }
-// Tarik SEMUA tabel dalam SATU permintaan HTTP (bukan 5 terpisah) lewat action "pullAll" —
-// ini kunci supaya interval polling bisa dipercepat tanpa mengalikan beban/kuota ke server.
-// Kalau ada tabel yang datanya masih terpotong (halaman berikutnya menyusul), otomatis
-// lanjut lagi sampai semua tabel benar-benar tersinkron.
+let pullBusy = false;
+let pullBusySince = 0;
+let pullFailCount = 0;
 async function pullAllFromCloud(showToast){
   if(!CLOUD_CFG.url) return;
-  try{
-    const cursors = {};
-    SYNC_TABLES.forEach(t => {
-      cursors[t] = {
-        since: Number(localStorage.getItem("sync_since_" + t) || 0),
-        epoch: localStorage.getItem("sync_epoch_" + t) || ""
-      };
-    });
-    const res = await cloudApi("pullAll", { cursors, limit: 5000 });
-    let anyMore = false;
-    for(const t of SYNC_TABLES){
-      const r = res.results && res.results[t];
-      if(!r) continue;
-      if(r.reset) await idbClearLocalOnly_(t);
-      if(r.rows && r.rows.length) await idbApplyPulledRows_(t, r.rows);
-      localStorage.setItem("sync_since_" + t, String(r.next));
-      localStorage.setItem("sync_epoch_" + t, r.epoch);
-      if(r.more) anyMore = true;
-    }
-    await primeRfidCache();
-    refreshCurrentTabView(); // supaya tab yang sedang dibuka langsung menampilkan data terbaru
-    if(anyMore) await pullAllFromCloud(showToast); // masih ada halaman lanjutan (data banyak/pertama kali)
-  }catch(err){
-    console.error("Gagal menarik data cloud:", err);
-    if(showToast) toast("Gagal menarik data cloud: " + err.message, "bad");
+  if(pullBusy){
+    if(Date.now() - pullBusySince < 180000) return; // sudah ada tarikan berjalan: jangan menumpuk request
+    pullBusy = false;
   }
+  pullBusy = true; pullBusySince = Date.now();
+  try{
+    for(let round = 0; round < 500; round++){
+      const cursors = {};
+      SYNC_TABLES.forEach(t => {
+        cursors[t] = {
+          since: Number(localStorage.getItem("sync_since_" + t) || 0),
+          epoch: localStorage.getItem("sync_epoch_" + t) || ""
+        };
+      });
+      const res = await cloudApi("pullAll", { cursors, limit: 5000 });
+      let anyMore = false, roundChanged = false, rfidChanged = false;
+      for(const t of SYNC_TABLES){
+        const r = res.results && res.results[t];
+        if(!r) continue;
+        if(r.reset){ await idbClearLocalOnly_(t); roundChanged = true; if(t === "rfidmap") rfidChanged = true; }
+        if(r.rows && r.rows.length){ await idbApplyPulledRows_(t, r.rows); roundChanged = true; if(t === "rfidmap") rfidChanged = true; }
+        localStorage.setItem("sync_since_" + t, String(r.next));
+        localStorage.setItem("sync_epoch_" + t, r.epoch);
+        if(r.more) anyMore = true;
+      }
+      // Hanya muat ulang cache & tampilan kalau memang ada data baru. Sebelumnya ini dijalankan di
+      // SETIAP siklus (getAll seluruh tabel RFID + render ulang dashboard/grafik), membuat UI berat.
+      if(rfidChanged) await primeRfidCache();
+      if(roundChanged) refreshCurrentTabView();
+      if(!anyMore) break; // masih ada halaman lanjutan (data banyak/pertama kali) -> ulangi
+    }
+    syncState.pullErr = null; syncState.lastPull = Date.now(); pullFailCount = 0;
+  }catch(err){
+    pullFailCount++;
+    console.error("Gagal menarik data cloud:", err);
+    syncState.pullErr = { msg: (err && err.message) || String(err), code: err && err.code };
+    if(showToast) toast("Gagal menarik data cloud: " + syncState.pullErr.msg, "bad");
+  }finally{
+    pullBusy = false;
+    renderConn_();
+  }
+}
+
+// Penjadwal tarik data: request berikutnya baru dijadwalkan SETELAH request sebelumnya selesai.
+// (Versi lama memakai setInterval 8 detik: kalau Apps Script butuh > 8 detik, request menumpuk,
+//  melewati batas 30 eksekusi bersamaan Apps Script, lalu semuanya gagal / "Failed to fetch".)
+const POLL_VISIBLE_MS = 4000;    // jeda antar tarikan saat aplikasi sedang dilihat
+const POLL_HIDDEN_MS = 45000;    // jeda saat tab di background
+let pollTimer = null;
+function schedulePoll_(delay){
+  if(pollTimer) clearTimeout(pollTimer);
+  pollTimer = setTimeout(async () => {
+    pollTimer = null;
+    try{ if(navigator.onLine !== false) await pullAllFromCloud(false); }catch(e){ /* sudah ditangani di dalam */ }
+    const base = document.visibilityState === "visible" ? POLL_VISIBLE_MS : POLL_HIDDEN_MS;
+    const wait = pullFailCount ? Math.min(30000, base * Math.pow(2, Math.min(pullFailCount, 4))) : base;
+    schedulePoll_(wait);
+  }, delay);
+}
+function syncNow_(){
+  if(!CLOUD_CFG.url){ toast("Atur URL Google Apps Script dulu (klik ⚙️).", "warning"); return; }
+  toast("Sinkron sekarang...", "warning");
+  flushFailCount = 0;
+  flushSyncQueue().then(() => pullAllFromCloud(true));
+}
+function startSyncLoops_(){
+  setInterval(() => { if(!syncBusy && !flushRetryTimer) flushSyncQueue(); }, 15000); // jaring pengaman (murah kalau antrean kosong)
+  window.addEventListener("online", () => { flushFailCount = 0; pullFailCount = 0; flushSyncQueue(); schedulePoll_(0); });
+  window.addEventListener("offline", () => { setConn(false, "Perangkat offline — data tetap tersimpan lokal"); });
+  // Begitu tab dibuka/difokuskan lagi, langsung tarik update terbaru.
+  document.addEventListener("visibilitychange", () => { if(document.visibilityState === "visible") schedulePoll_(0); });
+  const connTxt = document.getElementById("connText"), connDot = document.getElementById("connDot");
+  [connTxt, connDot].forEach(el => { if(el){ el.style.cursor = "pointer"; el.addEventListener("click", syncNow_); } });
+  schedulePoll_(POLL_VISIBLE_MS);
 }
 
 // Pengaturan Cloud: URL Web App (.../exec) & API Token, disimpan per browser.
@@ -6248,28 +6435,25 @@ btnPrintQR.onclick = () => {
   initSyncControls();
   updateSyncBadge();
 
+  // Timer sinkron dimulai LEBIH DULU dan sinkron awal berjalan di belakang layar. Sebelumnya init
+  // menunggu (await) ping ke server: kalau ping menggantung, timer sinkron tidak pernah aktif.
+  startSyncLoops_();
   if(!CLOUD_CFG.url){
     setConn(false, "Klik ⚙️ untuk atur URL Google Apps Script");
   } else {
-    try {
-      await cloudApi("ping");
-      setConn(true, "Tersambung ke Google Sheets");
-      await flushSyncQueue();
-      await pullAllFromCloud(false); // sudah memanggil refreshCurrentTabView() sendiri di dalamnya
-      refreshMasterStats();
-    } catch(e) {
-      console.error("Gagal konek Google Apps Script:", e);
-      setConn(false, "Mode Lokal Offline Aktif");
-    }
+    (async () => {
+      try {
+        await cloudApi("ping");
+        setConn(true, "Tersambung ke Google Sheets");
+        await flushSyncQueue();
+        await pullAllFromCloud(false); // sudah memanggil refreshCurrentTabView() sendiri bila ada data baru
+        refreshMasterStats();
+      } catch(e) {
+        console.error("Gagal konek Google Apps Script:", e);
+        setConn(false, "Belum tersambung — mencoba lagi otomatis");
+      }
+    })();
   }
-
-  // Sinkron berkala: kirim antrean lokal & tarik perubahan dari perangkat lain.
-  setInterval(() => { flushSyncQueue(); }, 15000); // jaring pengaman; perubahan biasanya sudah terkirim lewat scheduleFlushSoon()
-  setInterval(() => { pullAllFromCloud(false); }, 8000); // aman dipercepat: sekarang 1 request gabungan/siklus + jalan-pintas server saat idle
-  window.addEventListener("online", () => { flushSyncQueue(); pullAllFromCloud(false); });
-  // Begitu tab browser ini dibuka/difokuskan kembali (mis. pindah dari aplikasi lain), langsung
-  // tarik update terbaru — tidak perlu menunggu sampai interval 20 detik berikutnya.
-  document.addEventListener("visibilitychange", () => { if(document.visibilityState === "visible") pullAllFromCloud(false); });
 
   scanInput.focus();
 })();
