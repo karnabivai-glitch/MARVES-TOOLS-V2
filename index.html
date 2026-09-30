@@ -1568,8 +1568,16 @@ function idbEnqueueSync(table, op, keyOrKeys, dataOrRows){
       data: dataOrRows === undefined ? null : dataOrRows,
       ts: Date.now()
     });
-    tx.oncomplete = ()=>resolve();
+    tx.oncomplete = ()=>{ scheduleFlushSoon(); resolve(); };
   });
+}
+// Begitu ada perubahan (scan, transfer bin, dll), kirim ke Cloud SEGERA — tidak menunggu
+// timer periodik 20 detik. Di-debounce sebentar (900ms) supaya beberapa scan beruntun tidak
+// memicu banyak request terpisah, cukup satu setelah "jeda" aktivitas.
+let flushDebounceTimer = null;
+function scheduleFlushSoon(){
+  if(flushDebounceTimer) clearTimeout(flushDebounceTimer);
+  flushDebounceTimer = setTimeout(()=>{ flushDebounceTimer = null; flushSyncQueue(); }, 900);
 }
 function idbGetSyncQueue(limit){
   return new Promise((resolve)=>{
@@ -1740,14 +1748,34 @@ async function pullFromCloud(table){
   }
   return total;
 }
-// Tarik SEMUA tabel sekaligus secara paralel (bukan satu-satu berurutan) supaya total
-// waktu tunggu ditentukan oleh tabel yang paling lambat, bukan jumlah semua tabel.
+// Tarik SEMUA tabel dalam SATU permintaan HTTP (bukan 5 terpisah) lewat action "pullAll" —
+// ini kunci supaya interval polling bisa dipercepat tanpa mengalikan beban/kuota ke server.
+// Kalau ada tabel yang datanya masih terpotong (halaman berikutnya menyusul), otomatis
+// lanjut lagi sampai semua tabel benar-benar tersinkron.
 async function pullAllFromCloud(showToast){
   if(!CLOUD_CFG.url) return;
   try{
-    await Promise.all(SYNC_TABLES.map(t => pullFromCloud(t)));
+    const cursors = {};
+    SYNC_TABLES.forEach(t => {
+      cursors[t] = {
+        since: Number(localStorage.getItem("sync_since_" + t) || 0),
+        epoch: localStorage.getItem("sync_epoch_" + t) || ""
+      };
+    });
+    const res = await cloudApi("pullAll", { cursors, limit: 5000 });
+    let anyMore = false;
+    for(const t of SYNC_TABLES){
+      const r = res.results && res.results[t];
+      if(!r) continue;
+      if(r.reset) await idbClearLocalOnly_(t);
+      if(r.rows && r.rows.length) await idbApplyPulledRows_(t, r.rows);
+      localStorage.setItem("sync_since_" + t, String(r.next));
+      localStorage.setItem("sync_epoch_" + t, r.epoch);
+      if(r.more) anyMore = true;
+    }
     await primeRfidCache();
     refreshCurrentTabView(); // supaya tab yang sedang dibuka langsung menampilkan data terbaru
+    if(anyMore) await pullAllFromCloud(showToast); // masih ada halaman lanjutan (data banyak/pertama kali)
   }catch(err){
     console.error("Gagal menarik data cloud:", err);
     if(showToast) toast("Gagal menarik data cloud: " + err.message, "bad");
@@ -6236,8 +6264,8 @@ btnPrintQR.onclick = () => {
   }
 
   // Sinkron berkala: kirim antrean lokal & tarik perubahan dari perangkat lain.
-  setInterval(() => { flushSyncQueue(); }, 20000);
-  setInterval(() => { pullAllFromCloud(false); }, 20000); // dipercepat dari 60d ke 20d supaya perangkat lain terasa "hampir realtime"
+  setInterval(() => { flushSyncQueue(); }, 15000); // jaring pengaman; perubahan biasanya sudah terkirim lewat scheduleFlushSoon()
+  setInterval(() => { pullAllFromCloud(false); }, 8000); // aman dipercepat: sekarang 1 request gabungan/siklus + jalan-pintas server saat idle
   window.addEventListener("online", () => { flushSyncQueue(); pullAllFromCloud(false); });
   // Begitu tab browser ini dibuka/difokuskan kembali (mis. pindah dari aplikasi lain), langsung
   // tarik update terbaru — tidak perlu menunggu sampai interval 20 detik berikutnya.
