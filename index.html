@@ -1703,6 +1703,18 @@ function initSyncControls(){
 // Tarik perubahan dari server untuk satu tabel & terapkan ke IndexedDB lokal.
 // Dipakai agar data konsisten di semua perangkat/browser (multi-device).
 // Mengembalikan jumlah baris yang diterapkan.
+// Terapkan satu HALAMAN hasil pull (bisa ribuan baris) dalam SATU transaksi IndexedDB,
+// bukan satu transaksi per baris — ini yang paling menentukan cepat/lambatnya data
+// muncul saat aplikasi dibuka pertama kali di perangkat/browser baru.
+function idbApplyPulledRows_(table, rows){
+  return new Promise((resolve)=>{
+    const tx = idb.transaction(table, "readwrite");
+    const store = tx.objectStore(table);
+    rows.forEach(row => { if(row.d) store.delete(row.k); else store.put(row.v); });
+    tx.oncomplete = ()=>resolve();
+    tx.onerror = ()=>resolve(); // jangan sampai satu baris bermasalah menghentikan seluruh sinkron
+  });
+}
 async function pullFromCloud(table){
   const sinceKey = "sync_since_" + table;
   const epochKey = "sync_epoch_" + table;
@@ -1710,17 +1722,16 @@ async function pullFromCloud(table){
   let epoch = localStorage.getItem(epochKey) || "";
   let total = 0;
   while(true){
-    const res = await cloudApi("pull", { table, since, epoch, limit: 1000 });
+    const res = await cloudApi("pull", { table, since, epoch, limit: 5000 });
     if(res.reset){
       // Tabel pernah di-clear di server sejak sinkron terakhir: kosongkan cache lokal dulu.
       await idbClearLocalOnly_(table);
       since = 0;
     }
-    for(const row of res.rows){
-      if(row.d) await idbRawDelete(table, row.k);
-      else await idbRawPut(table, row.v);
+    if(res.rows.length){
+      await idbApplyPulledRows_(table, res.rows);
+      total += res.rows.length;
     }
-    total += res.rows.length;
     since = res.next;
     epoch = res.epoch;
     localStorage.setItem(sinceKey, String(since));
@@ -1729,11 +1740,14 @@ async function pullFromCloud(table){
   }
   return total;
 }
+// Tarik SEMUA tabel sekaligus secara paralel (bukan satu-satu berurutan) supaya total
+// waktu tunggu ditentukan oleh tabel yang paling lambat, bukan jumlah semua tabel.
 async function pullAllFromCloud(showToast){
   if(!CLOUD_CFG.url) return;
   try{
-    for(const t of SYNC_TABLES) await pullFromCloud(t);
+    await Promise.all(SYNC_TABLES.map(t => pullFromCloud(t)));
     await primeRfidCache();
+    refreshCurrentTabView(); // supaya tab yang sedang dibuka langsung menampilkan data terbaru
   }catch(err){
     console.error("Gagal menarik data cloud:", err);
     if(showToast) toast("Gagal menarik data cloud: " + err.message, "bad");
@@ -2203,7 +2217,9 @@ const tabNames = [
   { id: "qrcode", nav: "navQRCode", tab: "tab-qrcode" }
 ];
 
+let currentActiveTab = "scan";
 function switchTab(activeId) {
+  currentActiveTab = activeId;
   if (activeId === "allscan" || activeId === "bincl") {
       if (!sessionStorage.getItem("admin_unlocked")) {
           const pass = prompt("Masukkan Password Administrator untuk mengakses Data Induk & Konfigurasi:");
@@ -2262,6 +2278,46 @@ function switchTab(activeId) {
   if(activeId === "discrepancy") loadDiscrepancy();
   if(activeId === "movementanalysis") loadMovementAnalysis();
   if(activeId === "dashboardreport") loadDashboardReport();
+}
+
+// Dipanggil otomatis setelah sinkron dari Cloud (awal buka & tiap sinkron berkala), supaya
+// tab yang SEDANG DIBUKA langsung menampilkan data terbaru dari perangkat lain — tanpa perlu
+// pindah tab atau refresh manual. Tab entri data (scan/outbound/cyclecount/transferbin/qrcode)
+// SENGAJA tidak disentuh di sini supaya fokus input barcode/RFID yang sedang dipakai tidak
+// terganggu oleh refresh otomatis.
+function refreshCurrentTabView(){
+  try{
+    switch(currentActiveTab){
+      case "opname": loadOpnameTab(); break;
+      case "pivot": loadPivot(); break;
+      case "search":
+        performAdvSearch(document.getElementById("advSearchInput").value);
+        refreshBinOverviewStats();
+        break;
+      case "allscan": loadAllScan(); break;
+      case "bincl": loadBinCL(); break;
+      case "rfidmap": loadRfidMapTab(); break;
+      case "movement":
+        loadMovements(
+          document.getElementById("moveSearchSku").value,
+          document.getElementById("moveStartDate").value,
+          document.getElementById("moveEndDate").value
+        );
+        break;
+      case "historycctf":
+        loadHistoryCCTF(
+          document.getElementById("cctfSearchSku").value,
+          document.getElementById("cctfStartDate").value,
+          document.getElementById("cctfEndDate").value
+        );
+        break;
+      case "master": refreshMasterStats(); break;
+      case "discrepancy": loadDiscrepancy(); break;
+      case "movementanalysis": loadMovementAnalysis(); break;
+      case "dashboardreport": loadDashboardReport(); break;
+      default: break; // scan/outbound/cyclecount/transferbin/qrcode: dibiarkan, jaga fokus input
+    }
+  }catch(e){ console.error("refreshCurrentTabView gagal:", e); }
 }
 
 document.getElementById("navScan").onclick = () => switchTab("scan");
@@ -6171,7 +6227,7 @@ btnPrintQR.onclick = () => {
       await cloudApi("ping");
       setConn(true, "Tersambung ke Google Sheets");
       await flushSyncQueue();
-      await pullAllFromCloud(false);
+      await pullAllFromCloud(false); // sudah memanggil refreshCurrentTabView() sendiri di dalamnya
       refreshMasterStats();
     } catch(e) {
       console.error("Gagal konek Google Apps Script:", e);
@@ -6181,8 +6237,11 @@ btnPrintQR.onclick = () => {
 
   // Sinkron berkala: kirim antrean lokal & tarik perubahan dari perangkat lain.
   setInterval(() => { flushSyncQueue(); }, 20000);
-  setInterval(() => { pullAllFromCloud(false); }, 60000);
+  setInterval(() => { pullAllFromCloud(false); }, 20000); // dipercepat dari 60d ke 20d supaya perangkat lain terasa "hampir realtime"
   window.addEventListener("online", () => { flushSyncQueue(); pullAllFromCloud(false); });
+  // Begitu tab browser ini dibuka/difokuskan kembali (mis. pindah dari aplikasi lain), langsung
+  // tarik update terbaru — tidak perlu menunggu sampai interval 20 detik berikutnya.
+  document.addEventListener("visibilitychange", () => { if(document.visibilityState === "visible") pullAllFromCloud(false); });
 
   scanInput.focus();
 })();
