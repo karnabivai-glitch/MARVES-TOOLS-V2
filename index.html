@@ -397,7 +397,7 @@
   <div class="shell-right">
     <span id="syncQueueBadge" style="font-size:11px; opacity:0.85; margin-right:8px;"></span>
     <span class="shell-icon" id="btnCancelSync" title="Batalkan &amp; bersihkan antrean sinkron yang belum terkirim" style="cursor:pointer; margin-right:10px; display:none;">🛑</span>
-    <span class="shell-icon" id="btnCloudSettings" title="Pengaturan Cloud (URL &amp; Token Google Apps Script)" style="cursor:pointer; margin-right:10px;">⚙️</span>
+    <span class="shell-icon" id="btnCloudSettings" title="Pengaturan Cloud (URL &amp; Token Supabase)" style="cursor:pointer; margin-right:10px;">⚙️</span>
     <span>Marves Gudang RTS</span>
     <span class="shell-avatar">WH</span>
   </div>
@@ -1487,7 +1487,7 @@ function parseIdDate(dateStr) {
 }
 
 /* ============================================================
-   KONEKSI CLOUD (Google Apps Script + Google Sheets)
+   KONEKSI CLOUD (Supabase + Google Sheets)
    Menggantikan Firestore. Semua data (Master, Scan, Movement, Opname,
    RFID Map) kini disinkron ke Google Sheets lewat Web App Apps Script.
    URL & Token diatur lewat tombol ⚙️ di shell-bar (localStorage, per browser).
@@ -1495,15 +1495,24 @@ function parseIdDate(dateStr) {
 const COL_MASTER = "master"; // nama tabel/sheet master di backend GAS
 const SYNC_TABLES = ["master", "rfidmap", "scanlog", "movementlog", "opname"];
 
+// Ambil hanya "https://xxxx.supabase.co" dari teks apa pun yang ditempel (buang /rest/v1/, spasi, dsb.)
+function sbBase_(u){
+  u = String(u || "").trim();
+  if(u && !/^https?:\/\//i.test(u)) u = "https://" + u;
+  try { return new URL(u).origin; } catch(e){ return u.replace(/\/+$/, ""); }
+}
 const CLOUD_CFG = {
   url: localStorage.getItem("gas_url") || "",
-  token: localStorage.getItem("gas_token") || ""
+  token: localStorage.getItem("gas_token") || "",
+  key: localStorage.getItem("sb_key") || ""   // Supabase anon/publishable key
 };
-function saveCloudCfg(url, token){
+function saveCloudCfg(url, token, key){
   CLOUD_CFG.url = (url || "").trim();
   CLOUD_CFG.token = (token || "").trim();
   localStorage.setItem("gas_url", CLOUD_CFG.url);
   localStorage.setItem("gas_token", CLOUD_CFG.token);
+  CLOUD_CFG.key = (key || "").trim();
+  localStorage.setItem("sb_key", CLOUD_CFG.key);
 }
 
 // Timeout per jenis permintaan. Tanpa timeout, satu request Apps Script yang "menggantung"
@@ -1514,19 +1523,19 @@ const CLOUD_RETRYABLE_MSG = /lock|busy|sibuk|too many|terlalu banyak|rate|quota|
 function sleep_(ms){ return new Promise(r => setTimeout(r, ms)); }
 
 async function cloudApiOnce_(action, payload, extSignal){
-  const body = Object.assign({ action, token: CLOUD_CFG.token }, payload || {});
+  const body = { p_action: action, p_token: CLOUD_CFG.token, p_payload: payload || {} };
   const ctrl = new AbortController();
   let timedOut = false;
   const timer = setTimeout(() => { timedOut = true; ctrl.abort(); }, CLOUD_TIMEOUT_MS[action] || 30000);
   const onExtAbort = () => ctrl.abort();
   if(extSignal){ if(extSignal.aborted) ctrl.abort(); else extSignal.addEventListener("abort", onExtAbort); }
-  const mkTimeout = () => { const e = new Error("Server Google Apps Script terlalu lama merespons (timeout)."); e.code = "TIMEOUT"; return e; };
+  const mkTimeout = () => { const e = new Error("Server Supabase terlalu lama merespons (timeout)."); e.code = "TIMEOUT"; return e; };
   try{
     let res;
     try{
-      res = await fetch(CLOUD_CFG.url, {
+      res = await fetch(sbBase_(CLOUD_CFG.url) + "/rest/v1/rpc/wms_api", {
         method: "POST",
-        headers: { "Content-Type": "text/plain;charset=utf-8" }, // hindari CORS preflight ke Apps Script
+        headers: { "Content-Type": "application/json", "apikey": CLOUD_CFG.key },
         body: JSON.stringify(body),
         signal: ctrl.signal
       });
@@ -1535,7 +1544,7 @@ async function cloudApiOnce_(action, payload, extSignal){
       if(networkErr && networkErr.name === "AbortError") throw networkErr; // dibatalkan pengguna
       // Catatan: saat Apps Script kelebihan beban / kena kuota, Google membalas halaman error tanpa
       // header CORS, dan browser melaporkannya sebagai "Failed to fetch" (mirip offline).
-      const e = new Error("Tidak bisa menghubungi server Google Apps Script (" +
+      const e = new Error("Tidak bisa menghubungi server Supabase (" +
         (navigator.onLine === false ? "perangkat offline" : "server sibuk/menolak koneksi") + ").");
       e.code = "NETWORK"; throw e;
     }
@@ -1553,7 +1562,7 @@ async function cloudApiOnce_(action, payload, extSignal){
       const e = new Error("Respon server Apps Script tidak valid (HTTP " + res.status + ")" + (snippet ? ": " + snippet : "") + " — cek URL / deployment.");
       e.code = "BAD_RESPONSE"; throw e;
     }
-    if(!data.ok){ const e = new Error(data.error || "Gagal memproses permintaan."); e.code = data.code || "ERR"; throw e; }
+    if(!data.ok){ const e = new Error(data.error || data.message || "Gagal memproses permintaan."); e.code = data.code || "ERR"; throw e; }
     return data;
   } finally {
     clearTimeout(timer);
@@ -1564,7 +1573,7 @@ async function cloudApiOnce_(action, payload, extSignal){
 // Semua operasi ke server bersifat idempoten (put/del/clear berdasarkan key, pull berdasarkan
 // cursor), jadi aman diulang otomatis bila gagal sementara (jaringan, server sibuk, timeout).
 async function cloudApi(action, payload, signal, opts){
-  if(!CLOUD_CFG.url){ const e = new Error("URL Google Apps Script belum diatur. Klik ⚙️ di pojok kanan atas."); e.code = "NO_CFG"; throw e; }
+  if(!CLOUD_CFG.url){ const e = new Error("URL Supabase belum diatur. Klik ⚙️ di pojok kanan atas."); e.code = "NO_CFG"; throw e; }
   const maxTry = ((opts && opts.retries != null) ? opts.retries : 2) + 1;
   let lastErr;
   for(let i = 0; i < maxTry; i++){
@@ -1583,7 +1592,7 @@ async function cloudApi(action, payload, signal, opts){
 
 let idb;
 const IDB_NAME = "scan_wms_db";
-const IDB_VERSION = 6; // v6: tambah object store "syncqueue" untuk antrean sinkron ke Google Apps Script
+const IDB_VERSION = 6; // v6: tambah object store "syncqueue" untuk antrean sinkron ke Supabase
 
 function openIDB(){
   return new Promise((resolve, reject)=>{
@@ -1606,7 +1615,7 @@ function openIDB(){
    ANTREAN SINKRON (outbox pattern)
    Setiap tulis/hapus data operasional tetap instan ke IndexedDB
    (tidak menunggu jaringan), lalu dicatat di sini untuk dikirim ke
-   Google Apps Script di belakang layar oleh flushSyncQueue().
+   Supabase di belakang layar oleh flushSyncQueue().
    key/data boleh berupa satu nilai atau array (untuk operasi bulk).
    ------------------------------------------------------------ */
 function idbEnqueueSync(table, op, keyOrKeys, dataOrRows){
@@ -1714,7 +1723,7 @@ function renderConn_(){
     detail = syncState.pullErr.msg || "";
   } else {
     const last = Math.max(syncState.lastPull, syncState.lastPush);
-    text = last ? "Tersambung • sinkron " + fmtClock_(last) : "Tersambung ke Google Sheets";
+    text = last ? "Tersambung • sinkron " + fmtClock_(last) : "Tersambung ke Supabase";
     detail = "Klik untuk sinkron sekarang";
   }
   setConn(ok, text);
@@ -1823,7 +1832,7 @@ async function updateSyncBadge(){
 }
 // Batalkan proses sinkron yang sedang berjalan (best-effort) & buang seluruh antrean lokal
 // yang belum terkirim, supaya tidak terus dicoba ulang secara otomatis.
-// CATATAN: jika Google Apps Script sudah mulai memproses permintaan sebelumnya, proses di
+// CATATAN: jika Supabase sudah mulai memproses permintaan sebelumnya, proses di
 // server TIDAK ikut berhenti hanya karena koneksi dari sini dibatalkan — server tetap
 // menyelesaikan apa yang sedang dikerjakannya. Tombol ini menghentikan PENGIRIMAN BERIKUTNYA.
 function cancelSync(){
@@ -1839,7 +1848,7 @@ function initSyncControls(){
   const btn = document.getElementById("btnCancelSync");
   if(!btn) return;
   btn.onclick = () => {
-    if(!confirm("Batalkan & bersihkan antrean sinkron yang BELUM terkirim ke Cloud?\n\nCatatan: kalau ada permintaan yang SEDANG diproses di server (Google Apps Script) saat ini, permintaan itu tetap akan selesai di sisi server walau dibatalkan di sini. Kalau ada data yang sudah kadung masuk ke Sheet dan tidak diinginkan, hapus manual lewat tombol \"Clear SKU Cloud\" (untuk Master) atau bersihkan langsung di Google Sheets.")) return;
+    if(!confirm("Batalkan & bersihkan antrean sinkron yang BELUM terkirim ke Cloud?\n\nCatatan: kalau ada permintaan yang SEDANG diproses di server (Supabase) saat ini, permintaan itu tetap akan selesai di sisi server walau dibatalkan di sini. Kalau ada data yang sudah kadung masuk ke Sheet dan tidak diinginkan, hapus manual lewat tombol \"Clear SKU Cloud\" (untuk Master) atau bersihkan langsung di Google Sheets.")) return;
     cancelSync();
   };
 }
@@ -1953,7 +1962,7 @@ function schedulePoll_(delay){
   }, delay);
 }
 function syncNow_(){
-  if(!CLOUD_CFG.url){ toast("Atur URL Google Apps Script dulu (klik ⚙️).", "warning"); return; }
+  if(!CLOUD_CFG.url){ toast("Atur URL Supabase dulu (klik ⚙️).", "warning"); return; }
   toast("Sinkron sekarang...", "warning");
   flushFailCount = 0;
   flushSyncQueue().then(() => pullAllFromCloud(true));
@@ -1974,21 +1983,23 @@ function initCloudSettings(){
   const btn = document.getElementById("btnCloudSettings");
   if(!btn) return;
   btn.onclick = () => {
-    const url = prompt("URL Web App Google Apps Script (diakhiri /exec):", CLOUD_CFG.url);
+    const url = prompt("URL Project Supabase (contoh: https://xxxx.supabase.co):", CLOUD_CFG.url);
     if(url === null) return;
-    const token = prompt("API Token (lihat Execution Log setelah menjalankan setup() di Apps Script):", CLOUD_CFG.token);
+    const key = prompt("Supabase anon / publishable key:", CLOUD_CFG.key);
+    if(key === null) return;
+    const token = prompt("Token bersama (yang Anda isi di tabel wms_config):", CLOUD_CFG.token);
     if(token === null) return;
-    saveCloudCfg(url, token);
+    saveCloudCfg(url, token, key);
     toast("✓ Pengaturan cloud disimpan, mencoba menyambung...", "good");
     cloudApi("ping").then(()=>{
-      setConn(true, "Tersambung ke Google Sheets");
+      setConn(true, "Tersambung ke Supabase");
       pullAllFromCloud(true).then(()=>toast("✓ Data terbaru dari Cloud sudah ditarik", "good"));
       flushSyncQueue();
       if(typeof refreshMasterStats === "function") refreshMasterStats();
     }).catch(err=>{
       console.error(err);
       setConn(false, "Gagal terhubung");
-      toast("Gagal terhubung ke Google Apps Script: " + err.message, "bad");
+      toast("Gagal terhubung ke Supabase: " + err.message, "bad");
     });
   };
 }
@@ -6439,17 +6450,17 @@ btnPrintQR.onclick = () => {
   // menunggu (await) ping ke server: kalau ping menggantung, timer sinkron tidak pernah aktif.
   startSyncLoops_();
   if(!CLOUD_CFG.url){
-    setConn(false, "Klik ⚙️ untuk atur URL Google Apps Script");
+    setConn(false, "Klik ⚙️ untuk atur URL Supabase");
   } else {
     (async () => {
       try {
         await cloudApi("ping");
-        setConn(true, "Tersambung ke Google Sheets");
+        setConn(true, "Tersambung ke Supabase");
         await flushSyncQueue();
         await pullAllFromCloud(false); // sudah memanggil refreshCurrentTabView() sendiri bila ada data baru
         refreshMasterStats();
       } catch(e) {
-        console.error("Gagal konek Google Apps Script:", e);
+        console.error("Gagal konek Supabase:", e);
         setConn(false, "Belum tersambung — mencoba lagi otomatis");
       }
     })();
