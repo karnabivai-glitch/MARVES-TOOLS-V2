@@ -387,6 +387,36 @@
 </head>
 <body>
 
+<style>
+  body.role-restricted #btnCloudSettings, body.role-restricted #btnCancelSync,
+  body.role-restricted #dashboardPrintArea button[onclick*="fileDashLogo"] { display:none !important; }
+  #loginGate { position:fixed; inset:0; z-index:99999; display:flex; align-items:center; justify-content:center; padding:16px;
+    background:linear-gradient(135deg,#27476e,#5b8fc9); font-family:inherit; }
+  #loginGate .lg-card { background:var(--bg-card,#fff); color:var(--text-main,#222); width:100%; max-width:380px; border-radius:14px; padding:26px 22px; box-shadow:0 12px 40px rgba(0,0,0,.35); }
+  #loginGate h2 { margin:0 0 4px; font-size:20px; } #loginGate .lg-sub { font-size:12px; opacity:.7; margin-bottom:18px; }
+  #loginGate .lg-btn { display:flex; align-items:center; gap:12px; width:100%; text-align:left; padding:13px 14px; margin-bottom:10px; border:1px solid var(--border,#d5dbe3);
+    border-radius:10px; background:var(--bg-input,#f5f7fa); color:inherit; cursor:pointer; font-size:14px; font-weight:700; }
+  #loginGate .lg-btn:hover { border-color:var(--accent,#5b9bd5); }
+  #loginGate .lg-btn small { display:block; font-weight:400; opacity:.65; font-size:11px; }
+  #loginGate .lg-ico { font-size:22px; }
+  #loginGate #lgPassRow { display:none; margin:2px 0 6px; }
+  #loginGate #lgPass { width:100%; box-sizing:border-box; padding:11px; border:1px solid var(--border,#d5dbe3); border-radius:8px; font-size:14px; margin-bottom:8px; }
+  #loginGate #lgErr { color:#d9534f; font-size:12px; min-height:16px; margin-bottom:6px; }
+</style>
+<div id="loginGate">
+  <div class="lg-card">
+    <h2>SCAN<span style="color:var(--accent,#5b9bd5)">WMS</span> — Masuk</h2>
+    <div class="lg-sub">Pilih peran untuk melanjutkan</div>
+    <button class="lg-btn" id="lgAdmin"><span class="lg-ico">🔐</span><span>Admin<small>Akses penuh • perlu password</small></span></button>
+    <div id="lgPassRow">
+      <input type="password" id="lgPass" placeholder="Password Administrator" autocomplete="off">
+      <div id="lgErr"></div>
+      <button class="btn btn-accent" id="lgPassGo" style="width:100%;">Masuk sebagai Admin</button>
+    </div>
+    <button class="lg-btn" id="lgDash"><span class="lg-ico">🖥️</span><span>Dashboard Report<small>Hanya lihat dashboard • tanpa password</small></span></button>
+    <button class="lg-btn" id="lgSearch"><span class="lg-ico">🔎</span><span>Pencarian Riwayat<small>Hanya cari barang/riwayat • tanpa password</small></span></button>
+  </div>
+</div>
 <div class="shell-bar">
   <div class="shell-left">
     <span class="shell-icon" id="btnToggleSidebar" title="Buka/Tutup Sidebar">▤</span>
@@ -398,6 +428,8 @@
     <span id="syncQueueBadge" style="font-size:11px; opacity:0.85; margin-right:8px;"></span>
     <span class="shell-icon" id="btnCancelSync" title="Batalkan &amp; bersihkan antrean sinkron yang belum terkirim" style="cursor:pointer; margin-right:10px; display:none;">🛑</span>
     <span class="shell-icon" id="btnCloudSettings" title="Pengaturan Cloud (URL &amp; Token Supabase)" style="cursor:pointer; margin-right:10px;">⚙️</span>
+    <span id="roleBadge" style="font-size:10px; font-weight:800; background:rgba(255,255,255,.22); padding:3px 8px; border-radius:10px; margin-right:8px; letter-spacing:.5px;"></span>
+    <span class="shell-icon" id="btnLogout" title="Keluar / Ganti Peran" style="cursor:pointer; margin-right:10px;">🚪</span>
     <span>Marves Gudang RTS</span>
     <span class="shell-avatar">WH</span>
   </div>
@@ -554,6 +586,7 @@
               <select id="returChannel" class="input-sm hidden" style="margin-bottom: 10px; font-weight: bold; color: var(--warning);">
                  <option value="LIVE">Channel Retur: LIVE</option>
                  <option value="METRO">Channel Retur: METRO</option>
+                 <option value="BIASA">Channel Retur: BIASA</option>
               </select>
               <div style="display: flex; gap: 10px; margin-bottom: 10px;">
                 <input id="binInput" class="bin-input input-sm" type="text" placeholder="Lokasi Bin (Opsional)" autocomplete="off" style="margin-bottom: 0; flex: 1;">
@@ -886,7 +919,7 @@
       <section id="tab-pivot" class="hidden">
         <div class="card" style="height: 100%; display: flex; flex-direction: column; margin-bottom: 0;">
           <h3 class="card-header">Rekap Pivot Sesi Aktif</h3>
-          <div class="hint" style="margin-bottom:12px;">Tabel ini hanya menghitung kalkulasi data yang sedang Anda scan (Masuk dan Keluar) pada sesi yang sedang berjalan.</div>
+          <div class="hint" style="margin-bottom:12px;">Tabel ini hanya menghitung hasil scan yang masih berada di Staging. Setelah Eksekusi Inbound atau Batal &amp; Bersihkan Staging, rekap ini otomatis kosong.</div>
           <div class="btn-row">
             <button class="btn btn-accent btn-sm" id="btnExportPivot">⬇️ Export Laporan Pivot (Format Rapi)</button>
           </div>
@@ -1249,6 +1282,41 @@
              </div>
           </div>
 
+          <!-- ===== Stock Opname Harian ===== -->
+          <h3 class="card-header" style="margin: 8px 0 10px;">📋 Stock Opname Harian</h3>
+          <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 16px;">
+             <div class="stat-card" style="margin:0; border-bottom: 3px solid var(--accent);">
+                <div class="num" id="dashOpKpiToday" style="color:var(--accent);">0</div>
+                <div class="lbl">SKU Selesai Opname Hari Ini</div>
+             </div>
+             <div class="stat-card" style="margin:0; border-bottom: 3px solid var(--success);">
+                <div class="num" id="dashOpKpiAkurasi" style="color:var(--success);">0</div>
+                <div class="lbl">Akurasi Opname (30 Hari)</div>
+             </div>
+             <div class="stat-card" style="margin:0; border-bottom: 3px solid var(--danger);">
+                <div class="num" id="dashOpKpiDiff" style="color:var(--danger);">0</div>
+                <div class="lbl">SKU Selisih (30 Hari)</div>
+             </div>
+             <div class="stat-card" style="margin:0; border-bottom: 3px solid var(--warning);">
+                <div class="num" id="dashOpKpiNet" style="color:var(--warning);">0</div>
+                <div class="lbl">Net Selisih Unit (30 Hari)</div>
+             </div>
+          </div>
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px;">
+             <div class="card" style="margin:0;">
+                <h3 class="card-header">Tren Opname: Sesuai vs Selisih (14 Hari)</h3>
+                <div style="position:relative; height:260px;"><canvas id="chartOpTrend"></canvas></div>
+             </div>
+             <div class="card" style="margin:0;">
+                <h3 class="card-header">Komposisi Hasil Opname (30 Hari)</h3>
+                <div style="position:relative; height:260px;"><canvas id="chartOpComp"></canvas></div>
+             </div>
+             <div class="card" style="margin:0; grid-column: 1 / -1;">
+                <h3 class="card-header">Top 10 SKU Selisih Opname (30 Hari)</h3>
+                <div style="position:relative; height:300px;"><canvas id="chartOpTop"></canvas></div>
+             </div>
+          </div>
+
         </div>
       </section>
 
@@ -1501,6 +1569,8 @@ function sbBase_(u){
   if(u && !/^https?:\/\//i.test(u)) u = "https://" + u;
   try { return new URL(u).origin; } catch(e){ return u.replace(/\/+$/, ""); }
 }
+// Password Administrator (dipakai login Admin & semua konfirmasi admin). Ganti di sini saja.
+const ADMIN_PASSWORD = "z5z563";
 const CLOUD_CFG = {
   url: localStorage.getItem("gas_url") || "",
   token: localStorage.getItem("gas_token") || "",
@@ -2208,7 +2278,7 @@ document.getElementById("fileRfidMap").addEventListener("change", (e) => {
 
 document.getElementById("btnClearRfidMap").onclick = async () => {
   const pass = prompt("Masukkan Password Administrator untuk menghapus seluruh pemetaan RFID:");
-  if(pass !== "admin123"){
+  if(pass !== ADMIN_PASSWORD){
     if(pass !== null) toast("Password salah! Akses ditolak.", "bad");
     return;
   }
@@ -2449,7 +2519,7 @@ function switchTab(activeId) {
   if (activeId === "allscan" || activeId === "bincl") {
       if (!sessionStorage.getItem("admin_unlocked")) {
           const pass = prompt("Masukkan Password Administrator untuk mengakses Data Induk & Konfigurasi:");
-          if (pass === "admin123") {
+          if (pass === ADMIN_PASSWORD) {
               sessionStorage.setItem("admin_unlocked", "true");
               document.getElementById("navAllScan").classList.remove("locked");
               document.getElementById("navAllScan").innerHTML = "🌍 Data Induk (Unlocked)";
@@ -2673,7 +2743,7 @@ document.getElementById("btnExecInbound").onclick = async () => {
       if (scanResult) scanResult.innerHTML = "";
       if(!document.getElementById("tab-search").classList.contains("hidden")) renderBinOverview();
       if(!document.getElementById("tab-allscan").classList.contains("hidden")) loadAllScan();
-      if(!document.getElementById("tab-pivot").classList.contains("hidden")) loadPivot();
+      loadPivot();
       toast(`✓ ${count} item Inbound berhasil dieksekusi ke Data Induk`, "good");
   } catch (err) {
       console.error(err);
@@ -2824,6 +2894,7 @@ document.getElementById("btnClearScan").onclick = ()=>{
   renderInboundLog();
   const scanResult = document.getElementById("scanResult");
   if(scanResult) scanResult.innerHTML = "";
+  loadPivot();
   toast("✓ Staging Inbound dibersihkan", "good");
 };
 
@@ -3347,7 +3418,7 @@ async function performAdvSearch(query) {
 /* ============================================================
    5.5) OVERVIEW & MANAJEMEN BIN (Create / Delete, Password Protected)
    ============================================================ */
-const BIN_ADMIN_PASSWORD = "admin123";
+const BIN_ADMIN_PASSWORD = ADMIN_PASSWORD;
 let masterBins = JSON.parse(localStorage.getItem('masterBins') || '[]');
 function saveMasterBins() { localStorage.setItem('masterBins', JSON.stringify(masterBins)); }
 
@@ -3551,7 +3622,7 @@ window.processTransfer = async function(sku, oldBin) {
    ============================================================ */
 async function loadPivot(){
   try {
-      const inRows = await getActiveSessionScans(); 
+      const inRows = sessionInboundScans.slice(); // hanya data Staging Inbound yang sedang di-scan
       const pivotMap = {};
       const deactivatedBins = JSON.parse(localStorage.getItem('deactivatedBins') || '[]');
 
@@ -3602,7 +3673,7 @@ async function loadPivot(){
 }
 
 document.getElementById("btnExportPivot").onclick = async ()=>{
-  const inRows = await getActiveSessionScans();
+  const inRows = sessionInboundScans.slice(); // hanya data Staging Inbound yang sedang di-scan
   if(inRows.length === 0 && sessionOutboundScans.length === 0){ toast("Belum ada data di sesi ini", ""); return; }
 
   const pivotMap = {};
@@ -5536,6 +5607,69 @@ async function loadDashboardReport() {
           datasets: [{ data: rakData.length ? rakData : [1], backgroundColor: DASH_CHART_COLORS }]
       });
 
+      // ---- Stock Opname Harian: KPI + 3 chart ----
+      const opAll = (await idbGetAllOpname()).filter(Boolean);
+      const opTgt = {}; opAll.filter(o => o.kind === 'target').forEach(t => { opTgt[t.id] = t; });
+      const ymd = (ms) => { const x = new Date(ms); return x.getFullYear() + "-" + String(x.getMonth() + 1).padStart(2, "0") + "-" + String(x.getDate()).padStart(2, "0"); };
+      const opRes = opAll.filter(o => o.kind === 'result' && o.date).map(r => {
+          const tg = opTgt[`tgt_${r.date}_${r.sku}`];
+          const adj = (typeof opAdjustedSelisih === 'function') ? opAdjustedSelisih(r.selisih, tg && tg.traceType, tg && tg.traceQty) : r.selisih;
+          return { date: r.date, sku: r.sku, nama: r.nama || '', bin: r.bin || '-', qtySystem: r.qtySystem, qtyFisik: r.qtyFisik, adj: Number(adj) || 0 };
+      });
+      const opToday = ymd(now), opFrom30 = ymd(now - 29 * DAY_MS);
+      const op30 = opRes.filter(r => r.date >= opFrom30 && r.date <= opToday);
+      const opTodayDone = opRes.filter(r => r.date === opToday).length;
+      const opTodayTarget = opAll.filter(o => o.kind === 'target' && o.date === opToday && !o.hidden).length;
+      const opDiff30 = op30.filter(r => r.adj !== 0).length;
+      const opMatch30 = op30.length - opDiff30;
+      const opNet30 = op30.reduce((a, r) => a + r.adj, 0);
+      const opAkurasi = op30.length ? Math.round((opMatch30 / op30.length) * 1000) / 10 : null;
+      document.getElementById("dashOpKpiToday").textContent = formatAccounting(opTodayDone) + (opTodayTarget ? " / " + formatAccounting(opTodayTarget) : "");
+      document.getElementById("dashOpKpiAkurasi").textContent = opAkurasi === null ? "-" : opAkurasi + "%";
+      document.getElementById("dashOpKpiDiff").textContent = formatAccounting(opDiff30);
+      document.getElementById("dashOpKpiNet").textContent = (opNet30 > 0 ? "+" : "") + formatAccounting(opNet30);
+
+      const opDays = [], opMatchSeries = [], opDiffSeries = [];
+      for (let i = 13; i >= 0; i--) {
+          const key = ymd(now - i * DAY_MS);
+          opDays.push(new Date(now - i * DAY_MS).toLocaleDateString("id-ID", { day: '2-digit', month: '2-digit' }));
+          const dayRes = opRes.filter(r => r.date === key);
+          opDiffSeries.push(dayRes.filter(r => r.adj !== 0).length);
+          opMatchSeries.push(dayRes.filter(r => r.adj === 0).length);
+      }
+      renderDashChart('chartOpTrend', 'bar', {
+          labels: opDays,
+          datasets: [
+              { label: 'Sesuai', data: opMatchSeries, backgroundColor: '#4caf82' },
+              { label: 'Selisih', data: opDiffSeries, backgroundColor: '#e07a7a' }
+          ]
+      }, { scales: { x: { stacked: true }, y: { stacked: true, beginAtZero: true, ticks: { precision: 0, callback: (v) => formatAccounting(v) } } } });
+
+      const opLebih = op30.filter(r => r.adj > 0).length, opKurang = op30.filter(r => r.adj < 0).length;
+      const opCompData = [opMatch30, opLebih, opKurang];
+      renderDashChart('chartOpComp', 'doughnut', {
+          labels: op30.length ? ['Sesuai', 'Lebih (+)', 'Kurang (-)'] : ['Belum ada data'],
+          datasets: [{ data: op30.length ? opCompData : [1], backgroundColor: op30.length ? ['#4caf82', '#d9a256', '#e07a7a'] : ['#8a9aa8'] }]
+      });
+
+      const opSkuAgg = {};
+      op30.filter(r => r.adj !== 0).forEach(r => {
+          if (!opSkuAgg[r.sku]) opSkuAgg[r.sku] = { nama: r.nama, abs: 0, net: 0 };
+          opSkuAgg[r.sku].abs += Math.abs(r.adj); opSkuAgg[r.sku].net += r.adj;
+      });
+      const opTop = Object.entries(opSkuAgg).sort((a, b) => b[1].abs - a[1].abs).slice(0, 10);
+      renderDashChart('chartOpTop', 'bar', {
+          labels: opTop.map(([sku, info]) => `${sku} - ${truncLbl(info.nama, 28) || 'TIDAK DIKENALI'}`),
+          datasets: [{ label: 'Total Selisih (unit)', data: opTop.map(([, info]) => info.abs), backgroundColor: '#e07a7a' }]
+      }, {
+          indexAxis: 'y',
+          layout: { padding: { right: 42 } },
+          scales: {
+              x: { beginAtZero: true, ticks: { precision: 0, callback: (v) => formatAccounting(v) } },
+              y: { ticks: { autoSkip: false, font: { size: 10.5 } } }
+          }
+      }, [maQtyValuePlugin]);
+
       // Simpan snapshot data untuk tombol Export Excel
       dashReportCache = {
           generatedAt: new Date(),
@@ -5543,7 +5677,13 @@ async function loadDashboardReport() {
           topSkus: topSkus.map(([sku, info]) => ({ sku, nama: info.nama || 'TIDAK DIKENALI', qty: info.qty })),
           catCounts,
           rak: rakLabels.map((r, i) => ({ rak: r, qty: rakData[i] })),
-          trend: days.map((d, i) => ({ tanggal: d, inbound: inboundSeries[i], outbound: outboundSeries[i] }))
+          trend: days.map((d, i) => ({ tanggal: d, inbound: inboundSeries[i], outbound: outboundSeries[i] })),
+          opname: {
+              kpi: { selesaiHariIni: opTodayDone, targetHariIni: opTodayTarget, akurasi: opAkurasi, skuSelisih: opDiff30, netSelisih: opNet30, totalSkuDiopname: op30.length },
+              trend: opDays.map((d, i) => ({ tanggal: d, sesuai: opMatchSeries[i], selisih: opDiffSeries[i] })),
+              top: opTop.map(([sku, info]) => ({ sku, nama: info.nama || 'TIDAK DIKENALI', total: info.abs, net: info.net })),
+              detail: op30.slice().sort((a, b) => b.date.localeCompare(a.date))
+          }
       };
 
   } catch (err) {
@@ -5582,6 +5722,20 @@ function exportDashboardReportExcel() {
   const wsTrend = XLSX.utils.json_to_sheet(d.trend.map(x => ({ "Tanggal": x.tanggal, "Inbound": x.inbound, "Outbound": x.outbound })));
   XLSX.utils.book_append_sheet(wb, wsTrend, "Tren 14 Hari");
 
+  if (d.opname) {
+      const o = d.opname;
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet([
+          { "KPI": "SKU Selesai Opname Hari Ini", "Nilai": o.kpi.selesaiHariIni },
+          { "KPI": "SKU Target Opname Hari Ini", "Nilai": o.kpi.targetHariIni },
+          { "KPI": "Akurasi Opname 30 Hari (%)", "Nilai": o.kpi.akurasi === null ? "-" : o.kpi.akurasi },
+          { "KPI": "SKU Diopname (30 Hari)", "Nilai": o.kpi.totalSkuDiopname },
+          { "KPI": "SKU Selisih (30 Hari)", "Nilai": o.kpi.skuSelisih },
+          { "KPI": "Net Selisih Unit (30 Hari)", "Nilai": o.kpi.netSelisih },
+      ]), "Opname Ringkasan");
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(o.trend.map(x => ({ "Tanggal": x.tanggal, "Sesuai": x.sesuai, "Selisih": x.selisih }))), "Opname Tren 14 Hari");
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(o.top.map((x, i) => ({ "Peringkat": i + 1, "SKU": x.sku, "Nama Barang": x.nama, "Total Selisih (unit)": x.total, "Net Selisih": x.net }))), "Opname Top Selisih");
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(o.detail.map(x => ({ "Tanggal": x.date, "SKU": x.sku, "Nama Barang": x.nama, "Bin": x.bin, "Qty Sistem": x.qtySystem, "Qty Fisik": x.qtyFisik, "Selisih": x.adj }))), "Opname Detail 30 Hari");
+  }
   XLSX.writeFile(wb, `Dashboard_Report_${d.generatedAt.toISOString().slice(0, 10)}.xlsx`);
 }
 
@@ -5990,7 +6144,7 @@ document.getElementById("btnClearMovements").onclick = async ()=>{
 document.getElementById("btnClearMovementsAll").onclick = async () => {
   const pass = prompt("Masukkan Password Administrator untuk menghapus SEMUA Movement Log (Lokal & Cloud):");
   if (pass === null) return;
-  if (pass !== "admin123") { toast("Password salah! Akses ditolak.", "bad"); return; }
+  if (pass !== ADMIN_PASSWORD) { toast("Password salah! Akses ditolak.", "bad"); return; }
   if (!confirm("⚠️ Ini akan menghapus SELURUH Movement Log di Lokal DAN Cloud (Google Sheets) secara PERMANEN untuk semua perangkat. Lanjutkan?")) return;
   try{
     await idbClearMovements();
@@ -6242,7 +6396,7 @@ async function refreshMasterStats(){
 document.getElementById("btnClearMasterLocal").onclick = async () => {
   const pass = prompt("Masukkan Password Administrator untuk menghapus SKU Lokal:");
   if (pass === null) return;
-  if (pass !== "admin123") { toast("Password salah! Akses ditolak.", "bad"); return; }
+  if (pass !== ADMIN_PASSWORD) { toast("Password salah! Akses ditolak.", "bad"); return; }
   if (!confirm("Hapus SEMUA Master SKU di Cache Lokal (browser ini saja)?\n\nData di Cloud (Google Sheets) TIDAK akan terhapus, dan bisa ditarik ulang kapan saja lewat 'Tarik Master Data Cloud ke Lokal'.")) return;
 
   try {
@@ -6258,7 +6412,7 @@ document.getElementById("btnClearMasterLocal").onclick = async () => {
 document.getElementById("btnClearMasterCloud").onclick = async () => {
   const pass = prompt("Masukkan Password Administrator untuk menghapus SKU di Cloud (Google Sheets):");
   if (pass === null) return;
-  if (pass !== "admin123") { toast("Password salah! Akses ditolak.", "bad"); return; }
+  if (pass !== ADMIN_PASSWORD) { toast("Password salah! Akses ditolak.", "bad"); return; }
   if (!confirm("⚠️ PERINGATAN: Ini akan menghapus SEMUA Master SKU di Google Sheets Cloud secara PERMANEN untuk SEMUA pengguna aplikasi ini, bukan hanya di browser Anda.\n\nTindakan ini tidak bisa dibatalkan. Lanjutkan?")) return;
   if (!confirm("Konfirmasi sekali lagi: Anda yakin ingin menghapus seluruh Master SKU di Cloud?")) return;
 
@@ -6467,6 +6621,66 @@ btnPrintQR.onclick = () => {
   }
 
   scanInput.focus();
+})();
+
+/* ============ LOGIN & PERAN (Admin / Dashboard / Pencarian) ============ */
+(function initRoleLogin(){
+  const ROLE_TABS = { admin: null, dashboard: ["dashboardreport"], search: ["search"] };
+  const ROLE_LABEL = { admin: "ADMIN", dashboard: "DASHBOARD", search: "PENCARIAN" };
+  const gate = document.getElementById("loginGate");
+  const getRole = () => sessionStorage.getItem("wms_role") || "";
+  const allows = (id) => { const r = getRole(); if(!(r in ROLE_TABS)) return false; const a = ROLE_TABS[r]; return a === null || a.includes(id); };
+
+  // Semua pindah tab (menu, kode internal) wajib lolos pemeriksaan peran.
+  const origSwitch = switchTab;
+  switchTab = function(id){
+    if(!allows(id)){ toast("Akses ditolak untuk peran ini.", "bad"); return; }
+    return origSwitch(id);
+  };
+
+  function applyRole(role){
+    sessionStorage.setItem("wms_role", role);
+    const a = ROLE_TABS[role], admin = (role === "admin");
+    tabNames.forEach(t => { const n = document.getElementById(t.nav); if(n) n.style.display = (a === null || a.includes(t.id)) ? "" : "none"; });
+    document.querySelectorAll(".nav-group").forEach(g => {
+      g.style.display = Array.from(g.querySelectorAll(".nav-item")).some(i => i.style.display !== "none") ? "" : "none";
+    });
+    document.body.classList.toggle("role-restricted", !admin);
+    document.getElementById("roleBadge").textContent = ROLE_LABEL[role];
+    if(admin){
+      sessionStorage.setItem("admin_unlocked", "true"); // menu terkunci terbuka karena sudah login admin
+      const n1 = document.getElementById("navAllScan"), n2 = document.getElementById("navBinCL");
+      if(n1){ n1.classList.remove("locked"); n1.innerHTML = "🌍 Data Induk (Unlocked)"; }
+      if(n2){ n2.classList.remove("locked"); n2.innerHTML = "🏷️ Data Bin CL (Unlocked)"; }
+    } else {
+      sessionStorage.removeItem("admin_unlocked");
+    }
+    gate.style.display = "none";
+    origSwitch(admin ? "scan" : a[0]);
+  }
+
+  function tryAdmin(){
+    const inp = document.getElementById("lgPass");
+    if(inp.value === ADMIN_PASSWORD){ inp.value = ""; document.getElementById("lgErr").textContent = ""; applyRole("admin"); }
+    else { document.getElementById("lgErr").textContent = "Password salah."; inp.select(); }
+  }
+  document.getElementById("lgAdmin").onclick = () => {
+    document.getElementById("lgPassRow").style.display = "block";
+    document.getElementById("lgPass").focus();
+  };
+  document.getElementById("lgPassGo").onclick = tryAdmin;
+  document.getElementById("lgPass").addEventListener("keydown", e => { if(e.key === "Enter") tryAdmin(); });
+  document.getElementById("lgDash").onclick = () => applyRole("dashboard");
+  document.getElementById("lgSearch").onclick = () => applyRole("search");
+  document.getElementById("btnLogout").onclick = () => {
+    if(!confirm("Keluar dan kembali ke layar login?")) return;
+    sessionStorage.removeItem("wms_role"); sessionStorage.removeItem("admin_unlocked");
+    location.reload();
+  };
+
+  // Muat ulang halaman (F5) tetap di peran yang sama selama tab masih terbuka.
+  const saved = getRole();
+  if(saved in ROLE_TABS) applyRole(saved);
 })();
 </script>
 </body>
