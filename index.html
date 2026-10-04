@@ -405,16 +405,16 @@
 </style>
 <div id="loginGate">
   <div class="lg-card">
-    <h2>SCAN<span style="color:var(--accent,#5b9bd5)">WMS</span> — Masuk</h2>
+    <h2>INVENTORY<span style="color:var(--accent,#5b9bd5)">WMS</span></h2>
     <div class="lg-sub">Pilih peran untuk melanjutkan</div>
-    <button class="lg-btn" id="lgAdmin"><span class="lg-ico">🔐</span><span>Admin<small>Akses penuh • perlu password</small></span></button>
+    <button class="lg-btn" id="lgAdmin"><span class="lg-ico">🔐</span><span>Admin<small></small></span></button>
     <div id="lgPassRow">
       <input type="password" id="lgPass" placeholder="Password Administrator" autocomplete="off">
       <div id="lgErr"></div>
       <button class="btn btn-accent" id="lgPassGo" style="width:100%;">Masuk sebagai Admin</button>
     </div>
-    <button class="lg-btn" id="lgDash"><span class="lg-ico">🖥️</span><span>Dashboard Report<small>Hanya lihat dashboard • tanpa password</small></span></button>
-    <button class="lg-btn" id="lgSearch"><span class="lg-ico">🔎</span><span>Pencarian Riwayat<small>Hanya cari barang/riwayat • tanpa password</small></span></button>
+    <button class="lg-btn" id="lgDash"><span class="lg-ico">🖥️</span><span>Dashboard Report<small></small></span></button>
+    <button class="lg-btn" id="lgSearch"><span class="lg-ico">🔎</span><span>Pencarian Barang<small></small></span></button>
   </div>
 </div>
 <div class="shell-bar">
@@ -457,7 +457,7 @@
       <div class="nav-group">
         <div class="nav-group-title">Monitoring <span>▼</span></div>
         <div class="nav-group-items">
-          <button class="nav-item" id="navSearchTab">🔎 Pencarian Riwayat</button>
+          <button class="nav-item" id="navSearchTab">🔎 Pencarian Barang</button>
           <button class="nav-item" id="navPivot">📊 Rekap Pivot Sesi</button>
           <button class="nav-item" id="navMovement">📜 Tracking Movement</button>
           <button class="nav-item" id="navHistoryCCTF">📜 History CC & Transfer</button>
@@ -666,6 +666,13 @@
               <input id="outRemarkInput" class="bin-input input-sm" type="text" placeholder="Remark / Catatan (Cth: SO-999)" autocomplete="off">
               <input id="outScanInput" class="scan-input" type="text" placeholder="Tembak barcode keluar..." autocomplete="off">
               <div id="outScanResult"></div>
+            </div>
+            <div class="card" id="salesUploadCard" style="margin: 12px 0 0 0;">
+              <h3 class="card-header">📦 Upload Data Sales (Potong Stok via RFID)</h3>
+              <div style="font-size:11px; color:var(--text-muted); margin-bottom:8px; line-height:1.45;">Upload Excel report sales. Tiap <b>RFID Code</b> dicari di Data Induk, lalu unit itu dipotong dari bin tempat ia tersimpan. Ada pratinjau dulu sebelum stok dipotong.</div>
+              <input type="file" id="salesFile" accept=".xlsx,.xls,.csv" style="display:none;">
+              <button class="btn btn-accent" id="btnSalesPick" style="width:100%;">📂 Pilih File Sales &amp; Pratinjau</button>
+              <div id="salesPreview" style="margin-top:10px;"></div>
             </div>
           </div>
 
@@ -6621,6 +6628,107 @@ btnPrintQR.onclick = () => {
   }
 
   scanInput.focus();
+})();
+
+/* ============ UPLOAD SALES: potong Data Induk berdasarkan RFID Code ============ */
+(function initSalesUpload(){
+  const fileEl = document.getElementById("salesFile"), pickBtn = document.getElementById("btnSalesPick"), box = document.getElementById("salesPreview");
+  if(!fileEl || !pickBtn) return;
+  let plan = null; // { found:[], missing:[] }
+  const esc = (v) => String(v == null ? "" : v).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+  const normCode = (v) => { const raw = String(v == null ? "" : v).trim(); return (extractRfidCode(raw) || raw).toUpperCase(); };
+
+  pickBtn.onclick = () => { fileEl.value = ""; fileEl.click(); };
+  fileEl.onchange = () => { const f = fileEl.files[0]; if(f) readSales(f); };
+
+  function readSales(file){
+    box.innerHTML = '<span class="hint">Membaca file & mencocokkan RFID...</span>';
+    const reader = new FileReader();
+    reader.onload = async (evt) => {
+      try {
+        const wb = XLSX.read(evt.target.result, { type: "array" });
+        const rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { header: 1, defval: "" });
+        const hi = rows.findIndex(r => r.some(c => /rfid/i.test(String(c))));
+        if(hi === -1){ box.innerHTML = '<span style="color:var(--danger)">Kolom "RFID Code" tidak ditemukan di file.</span>'; return; }
+        const head = rows[hi].map(c => String(c).trim().toLowerCase());
+        const col = (re) => head.findIndex(h => re.test(h));
+        const cRfid = col(/rfid/), cSku = col(/^sku$/), cInv = col(/invoice/), cTkt = col(/ticket/), cType = col(/sales\s*type/);
+        const data = rows.slice(hi + 1).filter(r => String(r[cRfid] || "").trim());
+
+        const all = (await idbGetAllScans()).filter(r => r && r.type !== "OUT" && r.uid);
+        const byUid = {}; all.forEach(r => { const k = String(r.uid).trim().toUpperCase(); if(!byUid[k]) byUid[k] = r; });
+
+        const seen = new Set(), found = [], missing = [];
+        for(const r of data){
+          const code = normCode(r[cRfid]);
+          const meta = { rfid: code, skuFile: String(r[cSku] || "").trim(), invoice: String(r[cInv] || "").trim(), ticket: String(r[cTkt] || "").trim(), salesType: String(r[cType] || "").trim() };
+          if(seen.has(code)){ missing.push({ ...meta, alasan: "Duplikat di file (RFID sama muncul lagi)" }); continue; }
+          seen.add(code);
+          const row = byUid[code];
+          if(row){
+            const warn = meta.skuFile && String(row.sku).trim().toUpperCase() !== meta.skuFile.toUpperCase();
+            found.push({ ...meta, row, warn });
+          } else {
+            let mp = RFID_MAP[code] || await idbGetRfid(code);
+            missing.push({ ...meta, alasan: mp ? `RFID terdaftar (SKU ${mp.sku}) tapi tidak ada di Data Induk (belum inbound / sudah keluar)` : "RFID tidak terdaftar & tidak ada di Data Induk" });
+          }
+        }
+        plan = { found, missing, fileName: file.name };
+        renderPlan();
+      } catch(e){ console.error(e); box.innerHTML = '<span style="color:var(--danger)">Gagal membaca file: ' + esc(e.message) + '</span>'; }
+    };
+    reader.readAsArrayBuffer(file);
+  }
+
+  function renderPlan(){
+    const f = plan.found, m = plan.missing, warns = f.filter(x => x.warn).length;
+    const fRows = f.slice(0, 50).map(x => `<tr><td>${esc(x.rfid)}</td><td>${esc(x.row.sku)}</td><td><span class="badge muted">${esc(x.row.bin || "-")}</span></td><td>${esc(x.invoice)}</td>${x.warn ? '<td title="SKU di file berbeda dengan SKU di Data Induk">⚠</td>' : "<td></td>"}</tr>`).join("");
+    const mRows = m.slice(0, 50).map(x => `<tr><td>${esc(x.rfid)}</td><td>${esc(x.skuFile)}</td><td>${esc(x.alasan)}</td></tr>`).join("");
+    box.innerHTML = `
+      <div style="display:flex; gap:8px; margin-bottom:8px;">
+        <div class="stat-card" style="margin:0; flex:1;"><div class="num" style="color:var(--success)">${f.length}</div><div class="lbl">Akan dipotong</div></div>
+        <div class="stat-card" style="margin:0; flex:1; border-bottom:3px solid var(--danger);"><div class="num" style="color:var(--danger)">${m.length}</div><div class="lbl">Tidak cocok</div></div>
+      </div>
+      ${warns ? `<div class="hint" style="color:var(--warning); margin-bottom:6px;">⚠ ${warns} unit: SKU di file berbeda dengan SKU di Data Induk (tetap dipotong berdasarkan RFID).</div>` : ""}
+      ${f.length ? `<div style="max-height:170px; overflow:auto; margin-bottom:8px;"><table class="table-sm" style="width:100%; font-size:11px;"><thead><tr><th>RFID</th><th>SKU</th><th>Bin</th><th>Invoice</th><th></th></tr></thead><tbody>${fRows}</tbody></table>${f.length > 50 ? `<div class="hint">…dan ${f.length - 50} lainnya</div>` : ""}</div>` : ""}
+      ${m.length ? `<div style="max-height:150px; overflow:auto; margin-bottom:8px;"><table class="table-sm" style="width:100%; font-size:11px;"><thead><tr><th>RFID</th><th>SKU file</th><th>Alasan</th></tr></thead><tbody>${mRows}</tbody></table>${m.length > 50 ? `<div class="hint">…dan ${m.length - 50} lainnya (lihat laporan Excel)</div>` : ""}</div>` : ""}
+      <div style="display:flex; gap:8px; flex-wrap:wrap;">
+        <button class="btn btn-accent" id="btnSalesGo" ${f.length ? "" : "disabled"}>✅ Potong Stok Sekarang (${f.length} unit)</button>
+        <button class="btn" id="btnSalesCancel">Batal</button>
+      </div>`;
+    document.getElementById("btnSalesCancel").onclick = () => { plan = null; box.innerHTML = ""; };
+    document.getElementById("btnSalesGo").onclick = executeSales;
+  }
+
+  async function executeSales(){
+    if(!plan || !plan.found.length) return;
+    if(!confirm(`Potong ${plan.found.length} unit dari Data Induk berdasarkan RFID? Tindakan ini menghapus unit dari bin-nya.`)) return;
+    const btn = document.getElementById("btnSalesGo"); btn.disabled = true;
+    const done = [], failed = [];
+    for(let i = 0; i < plan.found.length; i++){
+      const x = plan.found[i];
+      btn.textContent = `Memproses ${i + 1} / ${plan.found.length}...`;
+      try {
+        const remark = ["SALES", x.salesType, x.invoice ? "INV " + x.invoice : "", x.ticket ? "TKT " + x.ticket : ""].filter(Boolean).join(" | ");
+        await idbDeleteScan(x.row.id);
+        await recordMovement(x.row.id, "OUTBOUND", x.row.sku, x.row.nama, x.row.bin, remark);
+        done.push(x);
+      } catch(e){ console.error(e); failed.push({ ...x, alasan: "Gagal memproses: " + e.message }); }
+    }
+    const report = [
+      ...done.map(x => ({ Status: "DIPOTONG", RFID: x.rfid, SKU: x.row.sku, Nama: x.row.nama || "", Bin: x.row.bin || "-", Invoice: x.invoice, Ticket: x.ticket, "Sales Type": x.salesType, Keterangan: x.warn ? "SKU file berbeda dengan Data Induk" : "" })),
+      ...plan.missing.concat(failed).map(x => ({ Status: "TIDAK DIPOTONG", RFID: x.rfid, SKU: x.skuFile, Nama: "", Bin: "", Invoice: x.invoice, Ticket: x.ticket, "Sales Type": x.salesType, Keterangan: x.alasan }))
+    ];
+    plan = null;
+    box.innerHTML = `<div class="result found"><div class="nama"><b>${done.length}</b> unit berhasil dipotong dari Data Induk${failed.length ? `, <b style="color:var(--danger)">${failed.length}</b> gagal` : ""}.</div>
+      <div style="margin-top:8px;"><button class="btn btn-accent" id="btnSalesReport">⬇ Unduh Laporan Hasil (Excel)</button></div></div>`;
+    document.getElementById("btnSalesReport").onclick = () => {
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(report), "Hasil Upload Sales");
+      XLSX.writeFile(wb, `Hasil_Upload_Sales_${new Date().toISOString().slice(0, 10)}.xlsx`);
+    };
+    toast(`✓ Sales: ${done.length} unit dipotong dari Data Induk`, "good");
+  }
 })();
 
 /* ============ LOGIN & PERAN (Admin / Dashboard / Pencarian) ============ */
