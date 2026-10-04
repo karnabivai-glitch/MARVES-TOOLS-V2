@@ -6631,11 +6631,21 @@ btnPrintQR.onclick = () => {
   const getRole = () => sessionStorage.getItem("wms_role") || "";
   const allows = (id) => { const r = getRole(); if(!(r in ROLE_TABS)) return false; const a = ROLE_TABS[r]; return a === null || a.includes(id); };
 
+  // Peran Dashboard/Pencarian: sidebar otomatis tertutup & konten selebar layar.
+  // (Tidak menyentuh pengaturan sidebar milik Admin yang tersimpan di localStorage.)
+  function forceFull(){
+    const sb = document.querySelector(".sidebar"); if(sb) sb.classList.add("collapsed");
+    const sc = document.querySelector(".section-container"); if(sc) sc.classList.add("wide");
+    const ca = document.querySelector(".content-area"); if(ca) ca.classList.add("tight");
+  }
+
   // Semua pindah tab (menu, kode internal) wajib lolos pemeriksaan peran.
   const origSwitch = switchTab;
   switchTab = function(id){
     if(!allows(id)){ toast("Akses ditolak untuk peran ini.", "bad"); return; }
-    return origSwitch(id);
+    const res = origSwitch(id);
+    if(getRole() !== "admin") forceFull(); // switchTab asli mengatur ulang lebar, jadi paksa lagi
+    return res;
   };
 
   function applyRole(role){
@@ -6657,6 +6667,7 @@ btnPrintQR.onclick = () => {
     }
     gate.style.display = "none";
     origSwitch(admin ? "scan" : a[0]);
+    if(!admin) forceFull();
   }
 
   function tryAdmin(){
